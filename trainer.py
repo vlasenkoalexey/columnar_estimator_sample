@@ -24,6 +24,7 @@ from google.cloud import bigquery
 BATCH_SIZE = 128
 EPOCHS = 5
 PROFILER = False
+SLOPPY = False
 
 SMALL_TRAIN_DATASET_SIZE = 366715  # select count(1) from `alekseyv-scalableai-dev.criteo_kaggle.train_small`
 
@@ -153,21 +154,28 @@ features = {
   'cat26': FixedLenFeature([], dtype=tf.string, default_value=""),
 }
 
-
-
 def get_dataset(table_name):
   global BATCH_SIZE
   global EPOCHS
   global CACHE
+  global SLOPPY
   filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}_small_norm_*'.format(table_name = table_name)
-
+  print('sloppy: ' + str(SLOPPY))
   if CACHE:
     return tf.data.experimental.make_batched_features_dataset(
-      filenames, BATCH_SIZE, features, reader=gzip_reader_fn
+      filenames,
+      BATCH_SIZE,
+      features,
+      reader=gzip_reader_fn,
+      sloppy_ordering = SLOPPY
     ).map (transform_row).take(get_training_steps_per_epoch()).cache().repeat(EPOCHS)
   else:
     return tf.data.experimental.make_batched_features_dataset(
-        filenames, BATCH_SIZE, features, reader=gzip_reader_fn,
+        filenames,
+        BATCH_SIZE,
+        features,
+        reader=gzip_reader_fn,
+        sloppy_ordering = SLOPPY,
         num_epochs = EPOCHS
     ).map (transform_row)
 
@@ -201,7 +209,7 @@ def train_estimator_linear(model_dir):
   config = tf.estimator.RunConfig().replace(save_summary_steps=10)
 
   profiler_hook = tf.train.ProfilerHook(
-      save_steps=get_training_steps_per_epoch() * EPOCHS - 1,
+      save_steps=get_training_steps_per_epoch(),
       output_dir=os.path.join(model_dir, "profiler"),
       show_dataflow=True,
       show_memory=True)
@@ -304,6 +312,12 @@ def get_args():
         default=False)
 
     args_parser.add_argument(
+        '--sloppy',
+        action='store_true',
+        help='sloppy_ordering parameter for make_batched_features_dataset.',
+        default=False)
+
+    args_parser.add_argument(
         '--docker-file-name',
         help='Ignored by this script')
 
@@ -327,6 +341,7 @@ def main():
     global EPOCHS
     global PROFILER
     global CACHE
+    global SLOPPY
     args = get_args()
 
     logging.getLogger().setLevel(logging.INFO)
@@ -346,6 +361,7 @@ def main():
     EPOCHS = args.num_epochs
     PROFILER = args.profiler
     CACHE = args.cache
+    SLOPPY = args.sloppy
 
     train_start_time = datetime.datetime.now()
 
