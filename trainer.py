@@ -22,6 +22,7 @@ from google.cloud import bigquery
 
 BATCH_SIZE = 128
 EPOCHS = 5
+PROFILER = False
 
 SMALL_TRAIN_DATASET_SIZE = 366715  # select count(1) from `alekseyv-scalableai-dev.criteo_kaggle.train_small`
 
@@ -183,11 +184,22 @@ def create_feature_columns():
 
   return real_valued_columns + categorical_columns
 
-def train_estimator_linear(strategy, model_dir):
+def train_estimator_linear(model_dir):
+  global PROFILER
+  global EPOCHS
+
   logging.info('training for {} steps'.format(get_max_steps()))
-  config = tf.estimator.RunConfig(
-          train_distribute=strategy,
-          eval_distribute=strategy).replace(save_summary_steps=10)
+  config = tf.estimator.RunConfig().replace(save_summary_steps=10)
+
+  profiler_hook = tf.train.ProfilerHook(
+      save_steps=get_training_steps_per_epoch(),
+      output_dir=os.path.join(model_dir, "profiler"),
+      show_dataflow=True,
+      show_memory=True)
+
+  hooks = []
+  if PROFILER:
+    hooks.append(profiler_hook)
 
   feature_columns = create_feature_columns()
   estimator = tf.estimator.LinearClassifier(
@@ -200,15 +212,13 @@ def train_estimator_linear(strategy, model_dir):
   logging.info('training and evaluating linear estimator model')
   tf.estimator.train_and_evaluate(
       estimator,
-      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train').repeat(EPOCHS), max_steps=get_max_steps()),
+      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train').repeat(EPOCHS), max_steps=get_max_steps(), hooks=hooks),
       eval_spec=tf.estimator.EvalSpec(input_fn=lambda: get_dataset('test')))
   logging.info('done evaluating estimator model')
 
-def train_estimator(strategy, model_dir):
+def train_estimator(model_dir):
   logging.info('training for {} steps'.format(get_max_steps()))
-  config = tf.estimator.RunConfig(
-          train_distribute=strategy,
-          eval_distribute=strategy)
+  config = tf.estimator.RunConfig()
   feature_columns = create_feature_columns()
   estimator = tf.estimator.DNNClassifier(
       optimizer=tf.compat.v1.train.GradientDescentOptimizer(learning_rate=0.005),
@@ -223,6 +233,30 @@ def train_estimator(strategy, model_dir):
       train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train').repeat(EPOCHS), max_steps=get_max_steps()),
       eval_spec=tf.estimator.EvalSpec(input_fn=lambda: get_dataset('test')))
   logging.info('done evaluating estimator model')
+
+def run_reader_benchmark(_):
+  global EPOCHS
+  global BATCH_SIZE
+  num_iterations = get_max_steps()
+  dataset = get_dataset('train').repeat(EPOCHS)
+  itr = tf.compat.v1.data.make_one_shot_iterator(dataset)
+  start = time.time()
+  n = 0
+  mini_batch = 100
+  for _ in range(num_iterations // mini_batch):
+    local_start = time.time()
+    start_n = n
+    for _ in range(mini_batch):
+      n += BATCH_SIZE
+      _ = itr.get_next()
+    local_end = time.time()
+    print('Processed %d entries in %f seconds. [%f] examples/s' % (
+        n - start_n, local_end - local_start,
+        (mini_batch * BATCH_SIZE) / (local_end - local_start)))
+  end = time.time()
+  print('Processed %d entries in %f seconds. [%f] examples/s' % (
+      n, end - start,
+      n / (end - start)))
 
 def get_args():
     """Define the task arguments with the default values.
@@ -249,11 +283,23 @@ def get_args():
         required=True)
 
     args_parser.add_argument(
+        '--startup-function',
+        help='Function name to execute when program is started.',
+        choices='train_estimator_linear train_estimator run_reader_benchmark',
+        default='train_estimator_linear')
+
+    args_parser.add_argument(
         '--docker-file-name',
         help='Ignored by this script')
 
     args_parser.add_argument(
         '--tensorboard',
+        action='store_true',
+        help='Ignored by this script.',
+        default=False)
+
+    args_parser.add_argument(
+        '--profiler',
         action='store_true',
         help='Ignored by this script.',
         default=False)
@@ -264,6 +310,7 @@ def main():
     print('running main')
     global BATCH_SIZE
     global EPOCHS
+    global PROFILER
     args = get_args()
 
     logging.getLogger().setLevel(logging.INFO)
@@ -273,14 +320,20 @@ def main():
 
     logging.warning('tf version: ' + tf.version.VERSION)
 
+    logging.info('startup_function arg: ' + str(args.startup_function))
+    startup_function = getattr(sys.modules[__name__], args.startup_function)
+
     model_dir = args.job_dir
     logging.info('Model will be saved to "%s..."', model_dir)
 
     BATCH_SIZE = args.batch_size
     EPOCHS = args.num_epochs
+    PROFILER = args.profiler
 
     train_start_time = datetime.datetime.now()
-    train_estimator_linear(None, model_dir)
+
+    startup_function(model_dir)
+
     logging.info('total train time including evaluation: (hh:mm:ss.ms) {}'.format(datetime.datetime.now() - train_start_time))
 
 if __name__ == '__main__':
