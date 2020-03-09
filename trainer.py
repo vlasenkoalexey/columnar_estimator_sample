@@ -18,6 +18,7 @@ import argparse
 import datetime
 
 from tensorflow.python.framework import dtypes
+from tensorflow.python.data.ops import dataset_ops
 from google.cloud import bigquery
 
 BATCH_SIZE = 128
@@ -153,14 +154,22 @@ features = {
 }
 
 
+
 def get_dataset(table_name):
   global BATCH_SIZE
-  #return read_gcs(table_name) if DATASET_SOURCE == DATASET_SOURCE_TYPE.gcs else read_bigquery(table_name)
+  global EPOCHS
+  global CACHE
   filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}_small_norm_*'.format(table_name = table_name)
-  dataset = tf.data.experimental.make_batched_features_dataset(
+
+  if CACHE:
+    return tf.data.experimental.make_batched_features_dataset(
       filenames, BATCH_SIZE, features, reader=gzip_reader_fn
-  ).map (transform_row)
-  return dataset
+    ).map (transform_row).take(get_training_steps_per_epoch()).cache().repeat(EPOCHS)
+  else:
+    return tf.data.experimental.make_batched_features_dataset(
+        filenames, BATCH_SIZE, features, reader=gzip_reader_fn,
+        num_epochs = EPOCHS
+    ).map (transform_row)
 
 def get_training_steps_per_epoch():
   return SMALL_TRAIN_DATASET_SIZE // BATCH_SIZE
@@ -192,7 +201,7 @@ def train_estimator_linear(model_dir):
   config = tf.estimator.RunConfig().replace(save_summary_steps=10)
 
   profiler_hook = tf.train.ProfilerHook(
-      save_steps=get_training_steps_per_epoch(),
+      save_steps=get_training_steps_per_epoch() * EPOCHS - 1,
       output_dir=os.path.join(model_dir, "profiler"),
       show_dataflow=True,
       show_memory=True)
@@ -212,7 +221,7 @@ def train_estimator_linear(model_dir):
   logging.info('training and evaluating linear estimator model')
   tf.estimator.train_and_evaluate(
       estimator,
-      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train').repeat(EPOCHS), max_steps=get_max_steps(), hooks=hooks),
+      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train'), max_steps=get_max_steps(), hooks=hooks),
       eval_spec=tf.estimator.EvalSpec(input_fn=lambda: get_dataset('test')))
   logging.info('done evaluating estimator model')
 
@@ -230,7 +239,7 @@ def train_estimator(model_dir):
   logging.info('training and evaluating estimator model')
   tf.estimator.train_and_evaluate(
       estimator,
-      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train').repeat(EPOCHS), max_steps=get_max_steps()),
+      train_spec=tf.estimator.TrainSpec(input_fn=lambda: get_dataset('train'), max_steps=get_max_steps()),
       eval_spec=tf.estimator.EvalSpec(input_fn=lambda: get_dataset('test')))
   logging.info('done evaluating estimator model')
 
@@ -238,7 +247,7 @@ def run_reader_benchmark(_):
   global EPOCHS
   global BATCH_SIZE
   num_iterations = get_max_steps()
-  dataset = get_dataset('train').repeat(EPOCHS)
+  dataset = get_dataset('train')
   itr = tf.compat.v1.data.make_one_shot_iterator(dataset)
   start = time.time()
   n = 0
@@ -285,8 +294,14 @@ def get_args():
     args_parser.add_argument(
         '--startup-function',
         help='Function name to execute when program is started.',
-        choices='train_estimator_linear train_estimator run_reader_benchmark',
+        choices=['train_estimator_linear', 'train_estimator', 'run_reader_benchmark'],
         default='train_estimator_linear')
+
+    args_parser.add_argument(
+        '--cache',
+        action='store_true',
+        help='Cache dataset between epochs.',
+        default=False)
 
     args_parser.add_argument(
         '--docker-file-name',
@@ -311,6 +326,7 @@ def main():
     global BATCH_SIZE
     global EPOCHS
     global PROFILER
+    global CACHE
     args = get_args()
 
     logging.getLogger().setLevel(logging.INFO)
@@ -329,6 +345,7 @@ def main():
     BATCH_SIZE = args.batch_size
     EPOCHS = args.num_epochs
     PROFILER = args.profiler
+    CACHE = args.cache
 
     train_start_time = datetime.datetime.now()
 
