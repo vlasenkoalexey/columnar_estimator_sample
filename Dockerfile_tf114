@@ -1,0 +1,11 @@
+# Dockerfile
+
+FROM tensorflow/tensorflow:1.14.0-py3
+
+WORKDIR /root
+
+RUN pip install google-cloud-logging
+RUN pip install google-cloud-bigquery
+RUN pip install pandas
+
+COPY trainer.py trainer.py
