@@ -8,4 +8,6 @@ RUN pip install google-cloud-logging
 RUN pip install google-cloud-bigquery
 RUN pip install pandas
 
+ENV GCS_READ_CACHE_BLOCK_SIZE_MB=16
+
 COPY trainer.py trainer.py

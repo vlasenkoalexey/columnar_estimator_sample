@@ -101,7 +101,6 @@ vocab_size = {
 }
 
 def transform_row(row_dict):
-  #tf.print(row_dict)
   label = row_dict.pop('label')
   row_dict.pop('row_hash') # not used
   return (row_dict, label)
@@ -160,7 +159,6 @@ def get_dataset(table_name):
   global CACHE
   global SLOPPY
   filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}_small_norm_*'.format(table_name = table_name)
-  print('sloppy: ' + str(SLOPPY))
   if CACHE:
     return tf.data.experimental.make_batched_features_dataset(
       filenames,
@@ -267,11 +265,11 @@ def run_reader_benchmark(_):
       n += BATCH_SIZE
       _ = itr.get_next()
     local_end = time.time()
-    print('Processed %d entries in %f seconds. [%f] examples/s' % (
+    logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
         n - start_n, local_end - local_start,
         (mini_batch * BATCH_SIZE) / (local_end - local_start)))
   end = time.time()
-  print('Processed %d entries in %f seconds. [%f] examples/s' % (
+  logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
       n, end - start,
       n / (end - start)))
 
@@ -336,7 +334,6 @@ def get_args():
     return args_parser.parse_args()
 
 def main():
-    print('running main')
     global BATCH_SIZE
     global EPOCHS
     global PROFILER
@@ -347,7 +344,7 @@ def main():
     logging.getLogger().setLevel(logging.INFO)
     logging.info('trainer called with following arguments:')
     logging.info(' '.join(sys.argv))
-    print('setup logging')
+    logging.info('setup logging')
 
     logging.warning('tf version: ' + tf.version.VERSION)
 
