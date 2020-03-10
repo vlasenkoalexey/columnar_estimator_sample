@@ -251,7 +251,6 @@ def train_estimator(model_dir):
   logging.info('done evaluating estimator model')
 
 def run_reader_benchmark(_):
-  global EPOCHS
   global BATCH_SIZE
   num_iterations = get_max_steps()
   dataset = get_dataset('train')
@@ -259,20 +258,24 @@ def run_reader_benchmark(_):
   start = time.time()
   n = 0
   mini_batch = 100
-  for _ in range(num_iterations // mini_batch):
-    local_start = time.time()
-    start_n = n
-    for _ in range(mini_batch):
-      row = itr.get_next()
-      if(row): n += BATCH_SIZE
-    local_end = time.time()
+  size = tf.shape(itr.get_next()[0]['cat1'])[0]
+  with tf.compat.v1.Session() as sess:
+    size_callable = sess.make_callable(size)
+    start = time.time()
+    n = 0
+    for _ in range(num_iterations // mini_batch):
+      local_start = time.time()
+      start_n = n
+      for _ in range(mini_batch):
+        n += size_callable()
+      local_end = time.time()
+      logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
+          n - start_n, local_end - local_start,
+          (mini_batch * BATCH_SIZE) / (local_end - local_start)))
+    end = time.time()
     logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
-        n - start_n, local_end - local_start,
-        (mini_batch * BATCH_SIZE) / (local_end - local_start)))
-  end = time.time()
-  logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
-      n, end - start,
-      n / (end - start)))
+        n, end - start,
+        n / (end - start)))
 
 def run_reader_benchmark_eager_mode(_):
   ops.enable_eager_execution()
