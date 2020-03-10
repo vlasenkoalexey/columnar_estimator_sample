@@ -18,6 +18,7 @@ import argparse
 import datetime
 
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
 from tensorflow.python.data.ops import dataset_ops
 from google.cloud import bigquery
 
@@ -262,12 +263,28 @@ def run_reader_benchmark(_):
     local_start = time.time()
     start_n = n
     for _ in range(mini_batch):
-      n += BATCH_SIZE
-      _ = itr.get_next()
+      row = itr.get_next()
+      if(row): n += BATCH_SIZE
     local_end = time.time()
     logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
         n - start_n, local_end - local_start,
         (mini_batch * BATCH_SIZE) / (local_end - local_start)))
+  end = time.time()
+  logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
+      n, end - start,
+      n / (end - start)))
+
+def run_reader_benchmark_eager_mode(_):
+  ops.enable_eager_execution()
+  global EPOCHS
+  global BATCH_SIZE
+  num_iterations = get_max_steps()
+  dataset = get_dataset('train')
+#  itr = tf.compat.v1.data.make_one_shot_iterator(dataset)
+  start = time.time()
+  n = 0
+  for row in dataset.take(num_iterations):
+    if(row): n += BATCH_SIZE
   end = time.time()
   logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
       n, end - start,
@@ -300,7 +317,7 @@ def get_args():
     args_parser.add_argument(
         '--startup-function',
         help='Function name to execute when program is started.',
-        choices=['train_estimator_linear', 'train_estimator', 'run_reader_benchmark'],
+        choices=['train_estimator_linear', 'train_estimator', 'run_reader_benchmark', 'run_reader_benchmark_eager_mode'],
         default='train_estimator_linear')
 
     args_parser.add_argument(
