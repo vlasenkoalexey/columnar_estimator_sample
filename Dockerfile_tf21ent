@@ -1,0 +1,7 @@
+# Dockerfile
+
+FROM gcr.io/deeplearning-platform-release/tf2-cpu.2-1
+
+WORKDIR /root
+
+COPY trainer.py trainer.py

@@ -16,18 +16,33 @@ import tensorflow as tf
 import google.cloud.logging
 import argparse
 import datetime
+import json
 
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.data.ops import dataset_ops
+from tensorflow.python.client import timeline
 from google.cloud import bigquery
 
-BATCH_SIZE = 128
-EPOCHS = 5
-PROFILER = False
-SLOPPY = False
+from tensorflow.python.platform import gfile
+from tensorflow.python.data.ops import readers as core_readers
+from tensorflow.python.data.experimental.ops import optimization
+from tensorflow.python.ops import io_ops
+from tensorflow.python.data.experimental.ops import interleave_ops
+from tensorflow.python.data.experimental.ops import parsing_ops
+from tensorflow.python.data.experimental.ops import shuffle_ops
 
+ARGS = None
 SMALL_TRAIN_DATASET_SIZE = 366715  # select count(1) from `alekseyv-scalableai-dev.criteo_kaggle.train_small`
+
+if tf.version.VERSION.startswith('2'):
+  GradientDescentOptimizer = tf.keras.optimizers.SGD
+  RunOptions = tf.compat.v1.RunOptions
+  RunMetadata = tf.compat.v1.RunMetadata
+else:
+  GradientDescentOptimizer = tf.train.GradientDescentOptimizer
+  RunOptions = tf.RunOptions
+  RunMetadata = tf.RunMetadata
 
 CSV_SCHEMA = [
       bigquery.SchemaField("label", "INTEGER", mode='REQUIRED'),
@@ -101,14 +116,6 @@ vocab_size = {
 'cat26':	601
 }
 
-def transform_row(row_dict):
-  label = row_dict.pop('label')
-  row_dict.pop('row_hash') # not used
-  return (row_dict, label)
-
-def gzip_reader_fn(filenames):
-  return tf.data.TFRecordDataset(filenames, compression_type="GZIP")
-
 FixedLenFeature = tf.io.FixedLenFeature
 features = {
   'label': FixedLenFeature([], dtype=tf.int64, default_value=0),
@@ -154,36 +161,93 @@ features = {
   'cat26': FixedLenFeature([], dtype=tf.string, default_value=""),
 }
 
+def transform_row(row_dict):
+  label = row_dict.pop('label')
+  row_dict.pop('row_hash') # not used
+  return (row_dict, label)
+
+def parse_and_transform(tfrecord):
+  example = tf.io.parse_example(tfrecord, features)
+  transformed_example = transform_row(example)
+  return transformed_example
+
 def get_dataset(table_name):
-  global BATCH_SIZE
-  global EPOCHS
-  global CACHE
-  global SLOPPY
+  global ARGS
   filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}_small_norm_*'.format(table_name = table_name)
-  if CACHE:
+
+  dataset_function = getattr(sys.modules[__name__], ARGS.dataset_function)
+  return dataset_function(filenames)
+
+def make_batched_features_dataset(filenames):
+  def gzip_reader_fn(filenames):
+    return tf.data.TFRecordDataset(filenames, compression_type="GZIP")
+
+  if ARGS.cache:
     return tf.data.experimental.make_batched_features_dataset(
       filenames,
-      BATCH_SIZE,
+      ARGS.batch_size,
       features,
       reader=gzip_reader_fn,
-      sloppy_ordering = SLOPPY
-    ).map (transform_row).take(get_training_steps_per_epoch()).cache().repeat(EPOCHS)
+      sloppy_ordering = ARGS.sloppy,
+      reader_num_threads=ARGS.reader_num_threads,
+      parser_num_threads=ARGS.parser_num_threads
+    ).map (transform_row).take(get_training_steps_per_epoch()).cache().repeat(ARGS.num_epochs)
   else:
     return tf.data.experimental.make_batched_features_dataset(
         filenames,
-        BATCH_SIZE,
+        ARGS.batch_size,
         features,
         reader=gzip_reader_fn,
-        sloppy_ordering = SLOPPY,
-        num_epochs = EPOCHS
+        sloppy_ordering = ARGS.sloppy,
+        num_epochs = ARGS.num_epochs,
+        reader_num_threads=ARGS.reader_num_threads,
+        parser_num_threads=ARGS.parser_num_threads
     ).map (transform_row)
 
+def manual_new_parallel_inteleave(filenames):
+  options = tf.data.Options()
+  options.experimental_deterministic = ARGS.sloppy
+  filenames_list = gfile.Glob(filenames)
+  files_dataset = dataset_ops.Dataset.from_tensor_slices(filenames_list).shuffle(len(filenames_list))
+
+  dataset = files_dataset.with_options(options).interleave(
+      lambda file_name: tf.data.TFRecordDataset(file_name, compression_type="GZIP"),
+      cycle_length = ARGS.reader_num_threads,
+      num_parallel_calls=ARGS.reader_num_threads) \
+    .shuffle(10000) \
+    .repeat(ARGS.num_epochs) \
+    .batch(ARGS.batch_size) \
+    .map(parse_and_transform, num_parallel_calls=ARGS.parser_num_threads) \
+
+  if ARGS.cache:
+    dataset = dataset.cache()
+  return dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+
+def manual_old_parallel_inteleave(filenames):
+  filenames_list = gfile.Glob(filenames)
+  files_dataset = dataset_ops.Dataset.from_tensor_slices(filenames_list).shuffle(len(filenames_list))
+
+  dataset = files_dataset.apply(
+      interleave_ops.parallel_interleave(
+        lambda filename: tf.data.TFRecordDataset(filename, compression_type="GZIP"),
+        cycle_length=ARGS.reader_num_threads,
+        sloppy=ARGS.sloppy)) \
+    .shuffle(10000) \
+    .repeat(ARGS.num_epochs) \
+    .batch(ARGS.batch_size) \
+    .map(parse_and_transform, num_parallel_calls=ARGS.parser_num_threads) \
+
+  if ARGS.cache:
+    dataset = dataset.cache()
+  return dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
 def get_training_steps_per_epoch():
-  return SMALL_TRAIN_DATASET_SIZE // BATCH_SIZE
+  return SMALL_TRAIN_DATASET_SIZE // ARGS.batch_size
 
 def get_max_steps():
-  global EPOCHS
-  return EPOCHS * get_training_steps_per_epoch()
+  global ARGS
+  return ARGS.num_epochs * get_training_steps_per_epoch()
 
 def create_feature_columns():
   real_valued_columns = [
@@ -201,27 +265,24 @@ def create_feature_columns():
   return real_valued_columns + categorical_columns
 
 def train_estimator_linear(model_dir):
-  global PROFILER
-  global EPOCHS
+  global ARGS
 
   logging.info('training for {} steps'.format(get_max_steps()))
   config = tf.estimator.RunConfig().replace(save_summary_steps=10)
 
-  profiler_hook = tf.train.ProfilerHook(
-      save_steps=get_training_steps_per_epoch(),
-      output_dir=os.path.join(model_dir, "profiler"),
-      show_dataflow=True,
-      show_memory=True)
-
   hooks = []
-  if PROFILER:
+  if ARGS.profiler:
+    profiler_hook = tf.estimator.ProfilerHook(
+    save_steps=get_training_steps_per_epoch(),
+    output_dir=os.path.join(model_dir, "profiler"),
+    show_dataflow=True,
+    show_memory=True)
     hooks.append(profiler_hook)
 
   feature_columns = create_feature_columns()
   estimator = tf.estimator.LinearClassifier(
       feature_columns=feature_columns,
-      #optimizer=tf.train.FtrlOptimizer(learning_rate=0.0001),
-      optimizer=tf.train.GradientDescentOptimizer(learning_rate=0.001),
+      optimizer=GradientDescentOptimizer(learning_rate=0.001),
       model_dir=model_dir,
       config=config
   )
@@ -250,44 +311,84 @@ def train_estimator(model_dir):
       eval_spec=tf.estimator.EvalSpec(input_fn=lambda: get_dataset('test')))
   logging.info('done evaluating estimator model')
 
-def run_reader_benchmark(_):
-  global BATCH_SIZE
+def run_reader_benchmark(model_dir):
+  global ARGS
+  tf.compat.v1.disable_eager_execution()
   num_iterations = get_max_steps()
   dataset = get_dataset('train')
   itr = tf.compat.v1.data.make_one_shot_iterator(dataset)
   start = time.time()
   n = 0
   mini_batch = 100
-  size = tf.shape(itr.get_next()[0]['cat1'])[0]
+  size = tf.shape(itr.get_next()[0]['cat1'])
+  run_options = RunOptions(trace_level=RunOptions.FULL_TRACE)
+  run_metadata= RunMetadata()
+  ops_metadata = []
+  batch_size = ARGS.batch_size
+  profiler = ARGS.profiler
+  profile_example_start = ARGS.profile_example_start
+  profile_example_end = ARGS.profile_example_end
+
   with tf.compat.v1.Session() as sess:
-    size_callable = sess.make_callable(size)
     start = time.time()
     n = 0
+    i = 0
     for _ in range(num_iterations // mini_batch):
       local_start = time.time()
       start_n = n
       for _ in range(mini_batch):
-        n += size_callable()
+        n += batch_size
+        if profiler and i >= profile_example_start and i < profile_example_end:
+          sess.run(size, options=run_options, run_metadata=run_metadata)
+          ops_metadata.append(run_metadata.step_stats)
+        else:
+          sess.run(size)
+        i += 1
       local_end = time.time()
       logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
           n - start_n, local_end - local_start,
-          (mini_batch * BATCH_SIZE) / (local_end - local_start)))
+          (mini_batch * batch_size) / (local_end - local_start)))
     end = time.time()
     logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
         n, end - start,
         n / (end - start)))
 
+    if ARGS.profiler:
+      if ARGS.profiler_combine_traces:
+        logging.info('Combinding trace events')
+        all_trace_events = []
+        for op_metadata in ops_metadata:
+          tl = timeline.Timeline(op_metadata)
+          ctf = tl.generate_chrome_trace_format()
+          trace_events = json.loads(ctf)['traceEvents']
+          all_trace_events.extend(trace_events)
+
+        logging.info('Dumping trace events to disk')
+        with open(os.path.join(model_dir, 'timeline.json'), 'w') as f:
+          f.write(json.dumps({'traceEvents' : all_trace_events}))
+      else:
+        logging.info('Dumping trace events to disk')
+        i = 0
+        for op_metadata in ops_metadata:
+          tl = timeline.Timeline(op_metadata)
+          ctf = tl.generate_chrome_trace_format().replace('\n', ' ')
+          with open(os.path.join(model_dir, 'timeline_%d.json' % i), 'w') as f:
+            f.write(ctf)
+          i += 1
+
+    logging.info('model dir: %s' % model_dir)
+
 def run_reader_benchmark_eager_mode(_):
   ops.enable_eager_execution()
-  global EPOCHS
-  global BATCH_SIZE
+  global ARGS
+  batch_size = ARGS.batch_size
   num_iterations = get_max_steps()
   dataset = get_dataset('train')
 #  itr = tf.compat.v1.data.make_one_shot_iterator(dataset)
   start = time.time()
   n = 0
   for row in dataset.take(num_iterations):
-    if(row): n += BATCH_SIZE
+    if(row): n += batch_size
   end = time.time()
   logging.info('Processed %d entries in %f seconds. [%f] examples/s' % (
       n, end - start,
@@ -336,6 +437,24 @@ def get_args():
         default=False)
 
     args_parser.add_argument(
+        '--reader-num-threads',
+        help='Number of reader threads, defaults to 1 which is same as default for tf.data.experimental.make_batched_features_dataset',
+        type=int,
+        default=1)
+
+    args_parser.add_argument(
+        '--parser-num-threads',
+        help='Number of parser threads, defaults to 2 which is same as default for tf.data.experimental.make_batched_features_dataset',
+        type=int,
+        default=2)
+
+    args_parser.add_argument(
+        '--dataset-function',
+        help='Function name that returns dataset.',
+        choices=['make_batched_features_dataset', 'manual_new_parallel_inteleave', 'manual_old_parallel_inteleave'],
+        default='make_batched_features_dataset')
+
+    args_parser.add_argument(
         '--docker-file-name',
         help='Ignored by this script')
 
@@ -348,18 +467,32 @@ def get_args():
     args_parser.add_argument(
         '--profiler',
         action='store_true',
-        help='Ignored by this script.',
+        help='Whether to attach profiler.',
         default=False)
+
+    args_parser.add_argument(
+        '--profiler-combine-traces',
+        action='store_true',
+        help='Whether to combine profiler traces.',
+        default=False)
+
+    args_parser.add_argument(
+        '--profile-example-start',
+        help='Index of first example to profile',
+        type=int,
+        default=0)
+
+    args_parser.add_argument(
+        '--profile-example-end',
+        help='Index of last example to profile',
+        type=int,
+        default=20)
 
     return args_parser.parse_args()
 
 def main():
-    global BATCH_SIZE
-    global EPOCHS
-    global PROFILER
-    global CACHE
-    global SLOPPY
-    args = get_args()
+    global ARGS
+    ARGS = get_args()
 
     logging.getLogger().setLevel(logging.INFO)
     logging.info('trainer called with following arguments:')
@@ -368,22 +501,14 @@ def main():
 
     logging.warning('tf version: ' + tf.version.VERSION)
 
-    logging.info('startup_function arg: ' + str(args.startup_function))
-    startup_function = getattr(sys.modules[__name__], args.startup_function)
+    logging.info('startup_function arg: ' + str(ARGS.startup_function))
+    startup_function = getattr(sys.modules[__name__], ARGS.startup_function)
 
-    model_dir = args.job_dir
+    model_dir = ARGS.job_dir
     logging.info('Model will be saved to "%s..."', model_dir)
 
-    BATCH_SIZE = args.batch_size
-    EPOCHS = args.num_epochs
-    PROFILER = args.profiler
-    CACHE = args.cache
-    SLOPPY = args.sloppy
-
     train_start_time = datetime.datetime.now()
-
     startup_function(model_dir)
-
     logging.info('total train time including evaluation: (hh:mm:ss.ms) {}'.format(datetime.datetime.now() - train_start_time))
 
 if __name__ == '__main__':
