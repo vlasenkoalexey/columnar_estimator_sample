@@ -365,7 +365,7 @@ def run_reader_benchmark(model_dir):
 
         logging.info('Dumping trace events to disk')
         with open(os.path.join(model_dir, 'timeline.json'), 'w') as f:
-          f.write(json.dumps({'traceEvents' : all_trace_events}))
+          f.write(json.dumps({'traceEvents' : all_trace_events}).replace('\n', ' '))
       else:
         logging.info('Dumping trace events to disk')
         i = 0
