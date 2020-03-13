@@ -206,7 +206,7 @@ def make_batched_features_dataset(filenames):
 
 def manual_new_parallel_inteleave(filenames):
   options = tf.data.Options()
-  options.experimental_deterministic = ARGS.sloppy
+  options.experimental_deterministic = not(ARGS.sloppy)
   filenames_list = gfile.Glob(filenames)
   files_dataset = dataset_ops.Dataset.from_tensor_slices(filenames_list).shuffle(len(filenames_list))
 
