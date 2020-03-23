@@ -34,6 +34,7 @@ from tensorflow.python.data.experimental.ops import shuffle_ops
 
 ARGS = None
 SMALL_TRAIN_DATASET_SIZE = 366715  # select count(1) from `alekseyv-scalableai-dev.criteo_kaggle.train_small`
+FULL_TRAIN_DATASET_SIZE = 3500000  # approximate
 
 if tf.version.VERSION.startswith('2'):
   GradientDescentOptimizer = tf.keras.optimizers.SGD
@@ -173,7 +174,9 @@ def parse_and_transform(tfrecord):
 
 def get_dataset(table_name):
   global ARGS
-  filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}_small_norm_*'.format(table_name = table_name)
+  filenames = 'gs://alekseyv-scalableai-dev-public-bucket/criteo_kaggle_from_bq_norm/{table_name}{dataset_size}_norm_*'.format(
+    table_name = table_name,
+    dataset_size = '_small' if ARGS.dataset_size == 'small' else '')
 
   dataset_function = getattr(sys.modules[__name__], ARGS.dataset_function)
   return dataset_function(filenames)
@@ -243,7 +246,8 @@ def manual_old_parallel_inteleave(filenames):
   return dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
 def get_training_steps_per_epoch():
-  return SMALL_TRAIN_DATASET_SIZE // ARGS.batch_size
+  train_dataset_size = SMALL_TRAIN_DATASET_SIZE if ARGS.dataset_size == 'small' else FULL_TRAIN_DATASET_SIZE
+  return train_dataset_size // ARGS.batch_size
 
 def get_max_steps():
   global ARGS
@@ -453,6 +457,12 @@ def get_args():
         help='Function name that returns dataset.',
         choices=['make_batched_features_dataset', 'manual_new_parallel_inteleave', 'manual_old_parallel_inteleave'],
         default='make_batched_features_dataset')
+
+    args_parser.add_argument(
+        '--dataset-size',
+        help='Dataset size to use',
+        choices=['small', 'full'],
+        default='small')
 
     args_parser.add_argument(
         '--docker-file-name',
